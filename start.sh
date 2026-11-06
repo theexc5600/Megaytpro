@@ -19,29 +19,37 @@ telegram-bot-api \
 API_PID=$!
 
 cleanup() {
-    kill "$API_PID" 2>/dev/null || true
+    echo "Stopping MegaYT Pro..."
+    kill -TERM "$API_PID" 2>/dev/null || true
+    wait "$API_PID" 2>/dev/null || true
 }
 
 trap cleanup EXIT INT TERM
 
-echo "Starting Telegram Bot API..."
+echo "Waiting for Telegram Bot API..."
+
+READY=0
 
 for i in $(seq 1 60); do
     if ! kill -0 "$API_PID" 2>/dev/null; then
-        echo "Telegram API server exited."
+        echo "Telegram API server exited unexpectedly."
         exit 1
     fi
 
     if curl -fsS http://127.0.0.1:8081/ >/dev/null; then
+        READY=1
         break
     fi
 
     sleep 2
 done
 
-kill -0 "$API_PID" || exit 1
+if [ "$READY" -ne 1 ]; then
+    echo "Telegram API startup timed out."
+    exit 1
+fi
 
-echo "Telegram API ready."
+echo "Telegram API is ready."
 echo "Starting MegaYT Pro..."
 
 exec python3 bot.py
