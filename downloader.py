@@ -1,12 +1,17 @@
 
 import asyncio
-import re
+import os
+import signal
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 from config import MAX_UPLOAD_BYTES
 
 QUALITIES = {360, 480, 720, 1080, 1440, 2160}
+
+VIDEO_EXTENSIONS = {
+    ".mp4", ".mkv", ".webm", ".mov"
+}
 
 
 def validate_url(url: str) -> bool:
@@ -20,12 +25,21 @@ def validate_url(url: str) -> bool:
         if host == "youtu.be":
             return bool(parsed.path.strip("/"))
 
-        if host in ("youtube.com", "www.youtube.com", "m.youtube.com"):
-            if parsed.path == "/watch":
-                return bool(parse_qs(parsed.query).get("v"))
+        valid_hosts = {
+            "youtube.com",
+            "www.youtube.com",
+            "m.youtube.com",
+            "music.youtube.com",
+        }
 
-            if parsed.path.startswith(("/shorts/", "/live/")):
-                return len(parsed.path.split("/")) >= 3
+        if host not in valid_hosts:
+            return False
+
+        if parsed.path == "/watch":
+            return bool(parse_qs(parsed.query).get("v"))
+
+        if parsed.path.startswith(("/shorts/", "/live/")):
+            return len(parsed.path.split("/")) >= 3
 
         return False
 
@@ -33,9 +47,27 @@ def validate_url(url: str) -> bool:
         return False
 
 
-def safe_title(value: str) -> str:
-    value = re.sub(r'[\\/:*?"<>|]', "_", value)
-    return value[:120].strip() or "youtube_media"
+async def stop_process_group(proc):
+    if proc.returncode is not None:
+        return
+
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+
+    try:
+        await asyncio.wait_for(
+            proc.wait(),
+            timeout=5,
+        )
+    except asyncio.TimeoutError:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+        await proc.wait()
 
 
 async def download_media(
@@ -43,9 +75,12 @@ async def download_media(
     folder: str,
     audio: bool = False,
     quality: int = 2160,
-    on_process=None
+    on_process=None,
 ):
-    if quality not in QUALITIES:
+    if not validate_url(url):
+        raise ValueError("Invalid individual YouTube video URL.")
+
+    if not audio and quality not in QUALITIES:
         raise ValueError("Unsupported video quality.")
 
     Path(folder).mkdir(parents=True, exist_ok=True)
@@ -87,51 +122,77 @@ async def download_media(
 
     command.append(url)
 
-    process = await asyncio.create_subprocess_exec(
+    proc = await asyncio.create_subprocess_exec(
         *command,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
 
     if on_process:
-        on_process(process)
+        on_process(proc)
 
-    stderr = []
+    communication = asyncio.create_task(proc.communicate())
 
-    while True:
-        line = await process.stderr.readline()
+    try:
+        _, stderr = await communication
 
-        if not line:
-            break
+    except asyncio.CancelledError:
+        cleanup = asyncio.create_task(
+            stop_process_group(proc)
+        )
 
-        decoded = line.decode(errors="replace").strip()
+        try:
+            await asyncio.shield(cleanup)
+        finally:
+            if not communication.done():
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(communication),
+                        timeout=5,
+                    )
+                except asyncio.TimeoutError:
+                    pass
 
-        if decoded:
-            stderr.append(decoded)
-            stderr = stderr[-20:]
+        raise
 
-    return_code = await process.wait()
+    if proc.returncode != 0:
+        error = stderr.decode(
+            errors="replace"
+        )[-2500:]
 
-    if return_code != 0:
         raise RuntimeError(
-            "\n".join(stderr[-8:]) or "Download process failed."
+            error or "YouTube download failed."
         )
 
     files = [
         p for p in Path(folder).iterdir()
         if p.is_file()
-        and p.suffix.lower() in {
-            ".mp4", ".mkv", ".webm", ".mp3", ".m4a"
-        }
+        and p.suffix.lower() in (
+            {".mp3", ".m4a", ".opus"}
+            if audio else VIDEO_EXTENSIONS
+        )
     ]
 
     if not files:
-        raise RuntimeError("No output media file was created.")
+        raise RuntimeError(
+            "Download completed without a valid media file."
+        )
 
-    media = max(files, key=lambda p: p.stat().st_mtime)
+    media = max(
+        files,
+        key=lambda p: p.stat().st_mtime,
+    )
 
-    if media.stat().st_size > MAX_UPLOAD_BYTES:
-        raise RuntimeError("Media exceeds the configured upload limit.")
+    size = media.stat().st_size
+
+    if size <= 0:
+        raise RuntimeError("Downloaded file is empty.")
+
+    if size > MAX_UPLOAD_BYTES:
+        raise RuntimeError(
+            "Downloaded file exceeds the configured upload limit."
+        )
 
     return media
-  
+    
