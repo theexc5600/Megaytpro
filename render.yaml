@@ -1,0 +1,36 @@
+
+services:
+  - type: worker
+    name: megayt-pro
+    runtime: docker
+    plan: starter
+
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+
+    autoDeploy: true
+
+    disk:
+      name: megayt-data
+      mountPath: /var/data
+      sizeGB: 10
+
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+
+      - key: TELEGRAM_API_ID
+        sync: false
+
+      - key: TELEGRAM_API_HASH
+        sync: false
+
+      - key: ADMIN_IDS
+        sync: false
+
+      - key: ALLOWED_USER_IDS
+        sync: false
+
+      - key: BOT_API_BASE
+        value: http://127.0.0.1:8081
+        
