@@ -1,3 +1,4 @@
+
 FROM ubuntu:24.04 AS api-builder
 
 RUN apt-get update && apt-get install -y \
@@ -32,7 +33,8 @@ WORKDIR /app
 COPY requirements.txt .
 
 RUN python3 -m venv /opt/venv \
-    && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
+    && /opt/venv/bin/pip install \
+    --no-cache-dir -r requirements.txt
 
 ENV PATH="/opt/venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
@@ -42,4 +44,3 @@ COPY . .
 RUN chmod +x start.sh
 
 CMD ["./start.sh"]
-
