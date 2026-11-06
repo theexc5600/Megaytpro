@@ -3,12 +3,12 @@ services:
   - type: worker
     name: megayt-pro
     runtime: docker
-    plan: starter
+    plan: 1c-2g
 
     dockerfilePath: ./Dockerfile
     dockerContext: .
 
-    autoDeploy: true
+    autoDeploy: false
 
     disk:
       name: megayt-data
@@ -29,7 +29,7 @@ services:
         sync: false
 
       - key: ALLOWED_USER_IDS
-        sync: false
+        value: ""
 
       - key: BOT_API_BASE
         value: http://127.0.0.1:8081
