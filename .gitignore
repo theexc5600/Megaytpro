@@ -1,0 +1,15 @@
+
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+downloads/
+*.log
+*.tmp
+
+.DS_Store
