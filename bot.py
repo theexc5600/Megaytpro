@@ -1,6 +1,7 @@
 
 import asyncio
 import logging
+import os
 import tempfile
 from pathlib import Path
 
@@ -11,58 +12,92 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 
 from config import (
-    BOT_TOKEN, BOT_API_BASE, ADMIN_IDS,
-    INITIAL_ALLOWED_IDS, AUTH_FILE,
-    DOWNLOAD_DIR, MAX_UPLOAD_BYTES,
-    MAX_CONCURRENT_DOWNLOADS
+    BOT_TOKEN,
+    BOT_API_BASE,
+    ADMIN_IDS,
+    INITIAL_ALLOWED_IDS,
+    AUTH_FILE,
+    REVOKED_FILE,
+    DOWNLOAD_DIR,
+    MAX_UPLOAD_BYTES,
+    MAX_CONCURRENT_DOWNLOADS,
 )
-from downloader import validate_url, download_media, QUALITIES
 
-logging.basicConfig(level=logging.INFO)
+from downloader import (
+    validate_url,
+    download_media,
+    QUALITIES,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+
 log = logging.getLogger("MegaYTPro")
 
+# Telegram API connection
 api = TelegramAPIServer.from_base(
     BOT_API_BASE,
-    is_local=True
+    is_local=True,
 )
 
 session = AiohttpSession(api=api)
 bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher()
 
-allowed_users = set(INITIAL_ALLOWED_IDS) | set(ADMIN_IDS)
-jobs = {}
-cancelled = set()
+# User access and job tracking
+allowed_users = set(ADMIN_IDS) | set(INITIAL_ALLOWED_IDS)
+revoked_users = set()
+
+download_tasks = {}
+download_processes = {}
 active_users = set()
 
 slots = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 auth_lock = asyncio.Lock()
 
 
-def load_authorized_users():
-    Path(AUTH_FILE).parent.mkdir(parents=True, exist_ok=True)
-
+def read_ids(filename):
     try:
-        with open(AUTH_FILE, "r") as f:
-            for line in f:
-                value = line.strip()
-                if value.isdigit():
-                    allowed_users.add(int(value))
+        return {
+            int(line.strip())
+            for line in Path(filename).read_text().splitlines()
+            if line.strip().isdigit()
+        }
     except FileNotFoundError:
-        pass
-
-    save_authorized_users()
+        return set()
 
 
-def save_authorized_users():
-    Path(AUTH_FILE).parent.mkdir(parents=True, exist_ok=True)
-    temporary = AUTH_FILE + ".tmp"
+def save_ids(filename, values):
+    path = Path(filename)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(temporary, "w") as f:
-        for user_id in sorted(allowed_users):
-            f.write(f"{user_id}\n")
+    temporary = path.with_suffix(path.suffix + ".tmp")
 
-    Path(temporary).replace(AUTH_FILE)
+    temporary.write_text(
+        "".join(f"{user_id}\n" for user_id in sorted(values))
+    )
+
+    os.replace(temporary, path)
+
+
+def load_authorized_users():
+    global allowed_users, revoked_users
+
+    allowed_users |= read_ids(AUTH_FILE)
+    revoked_users = read_ids(REVOKED_FILE)
+
+    # Revocations always take precedence over initial access.
+    allowed_users.difference_update(revoked_users)
+    allowed_users.update(ADMIN_IDS)
+
+    log.info("Loaded %s authorized users", len(allowed_users))
+
+
+def save_access():
+    save_ids(AUTH_FILE, allowed_users - ADMIN_IDS)
+    save_ids(REVOKED_FILE, revoked_users)
 
 
 def is_admin(user_id):
@@ -70,10 +105,22 @@ def is_admin(user_id):
 
 
 def is_authorized(user_id):
-    return user_id in allowed_users
+    return (
+        user_id in allowed_users
+        and user_id not in revoked_users
+    )
 
 
 async def authorize(message: Message):
+    if not message.from_user:
+        return False
+
+    if message.chat.type != "private":
+        await message.answer(
+            "Please use MegaYT Pro in a private chat."
+        )
+        return False
+
     user_id = message.from_user.id
 
     if is_authorized(user_id):
@@ -87,17 +134,43 @@ async def authorize(message: Message):
     return False
 
 
+async def admin_only(message: Message):
+    if not message.from_user:
+        return False
+
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Administrator access required.")
+        return False
+
+    return True
+
+
+async def stop_process(proc):
+    if proc is None or proc.returncode is not None:
+        return
+
+    try:
+        proc.terminate()
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+    except ProcessLookupError:
+        pass
+
+
 async def send_help(message: Message):
     await message.answer(
-        "🚀 MegaYT Pro v3\n\n"
+        "🚀 MegaYT Pro v3.1\n\n"
         "/video URL [quality] - Download video\n"
         "/audio URL - Download MP3\n"
         "/cancel - Cancel your download\n"
         "/status - Bot status\n"
-        "/help - Help\n"
-        "/about - About\n\n"
-        "Available qualities: 360, 480, 720, "
-        "1080, 1440, 2160.\n"
+        "/help - Show commands\n"
+        "/about - About the bot\n\n"
+        "Quality options:\n"
+        "360p, 480p, 720p, 1080p, 1440p, 2160p\n\n"
+        "Individual YouTube videos only.\n"
         "Playlists are disabled."
     )
 
@@ -106,21 +179,20 @@ async def process_download(
     message: Message,
     url: str,
     audio=False,
-    quality=2160
+    quality=2160,
 ):
     user_id = message.from_user.id
 
-    if not await authorize(message):
+    if not is_authorized(user_id):
+        await authorize(message)
         return
 
     if not validate_url(url):
-        await message.answer("❌ Invalid YouTube URL.")
+        await message.answer("❌ Invalid YouTube video URL.")
         return
 
     if not audio and quality not in QUALITIES:
-        await message.answer(
-            "❌ Choose: 360, 480, 720, 1080, 1440 or 2160."
-        )
+        await message.answer("❌ Unsupported video quality.")
         return
 
     if user_id in active_users:
@@ -130,24 +202,31 @@ async def process_download(
         return
 
     active_users.add(user_id)
+    current_task = asyncio.current_task()
+    download_tasks[user_id] = current_task
+
     status = None
+    media = None
 
     try:
         async with slots:
+            if not is_authorized(user_id):
+                raise PermissionError("Access was revoked.")
+
             status = await message.answer(
-                "⏳ Download starting..."
+                "⏳ Preparing your download..."
             )
 
             with tempfile.TemporaryDirectory(
                 prefix="megayt_",
-                dir=DOWNLOAD_DIR
+                dir=DOWNLOAD_DIR,
             ) as folder:
 
                 def register_process(proc):
-                    jobs[user_id] = proc
+                    download_processes[user_id] = proc
 
                 await status.edit_text(
-                    "⬇️ Downloading media...\n"
+                    "⬇️ Downloading...\n"
                     f"Quality: {'MP3' if audio else str(quality) + 'p'}"
                 )
 
@@ -156,22 +235,30 @@ async def process_download(
                     folder=folder,
                     audio=audio,
                     quality=quality,
-                    on_process=register_process
+                    on_process=register_process,
                 )
 
-                jobs.pop(user_id, None)
+                download_processes.pop(user_id, None)
 
-                if user_id in cancelled:
-                    cancelled.discard(user_id)
-                    await status.edit_text("🚫 Download cancelled.")
-                    return
+                if not is_authorized(user_id):
+                    raise PermissionError("Access was revoked.")
 
-                await status.edit_text("📤 Uploading to Telegram...")
+                if not media.exists():
+                    raise RuntimeError("Downloaded file is missing.")
 
                 size = media.stat().st_size
 
-                if size > MAX_UPLOAD_BYTES:
-                    raise RuntimeError("Upload limit exceeded.")
+                if size <= 0 or size > MAX_UPLOAD_BYTES:
+                    raise RuntimeError(
+                        "File is empty or exceeds the upload limit."
+                    )
+
+                await status.edit_text(
+                    "📤 Uploading your media to Telegram..."
+                )
+
+                if not is_authorized(user_id):
+                    raise PermissionError("Access was revoked.")
 
                 await message.answer_document(
                     FSInputFile(media, filename=media.name),
@@ -179,33 +266,56 @@ async def process_download(
                         "✅ Download completed!\n\n"
                         f"📁 {media.name}\n"
                         f"📦 {size / (1024 ** 2):.1f} MB"
-                    )
+                    ),
                 )
 
-                await status.edit_text("✅ Successfully delivered.")
+                await status.edit_text(
+                    "✅ Your media was delivered successfully."
+                )
 
-    except Exception:
-        log.exception("Download failed")
-
-        text = (
-            "🚫 Download cancelled."
-            if user_id in cancelled
-            else "❌ Download failed. Check the URL, "
-                 "availability, quality or file size."
-        )
+    except asyncio.CancelledError:
+        await stop_process(download_processes.get(user_id))
 
         if status:
             try:
-                await status.edit_text(text)
+                await status.edit_text(
+                    "🚫 Download cancelled."
+                )
+            except Exception:
+                pass
+
+    except PermissionError:
+        await stop_process(download_processes.get(user_id))
+
+        if status:
+            try:
+                await status.edit_text(
+                    "🔒 Your access is no longer authorized."
+                )
+            except Exception:
+                pass
+
+    except Exception:
+        log.exception("Download failed for user %s", user_id)
+
+        if status:
+            try:
+                await status.edit_text(
+                    "❌ Download failed.\n"
+                    "Check the URL, quality, available storage "
+                    "or Telegram upload connection."
+                )
             except Exception:
                 pass
         else:
-            await message.answer(text)
+            await message.answer("❌ Download failed.")
 
     finally:
-        jobs.pop(user_id, None)
-        cancelled.discard(user_id)
+        download_processes.pop(user_id, None)
         active_users.discard(user_id)
+
+        if download_tasks.get(user_id) is current_task:
+            download_tasks.pop(user_id, None)
 
 
 @dp.message(CommandStart())
@@ -224,7 +334,8 @@ async def help_command(message: Message):
 async def about(message: Message):
     if await authorize(message):
         await message.answer(
-            "MegaYT Pro v3\nPrivate YouTube downloader."
+            "MegaYT Pro v3.1\n"
+            "Private YouTube media downloader."
         )
 
 
@@ -234,9 +345,10 @@ async def status_command(message: Message):
         return
 
     await message.answer(
-        "🟢 Bot online\n"
-        f"Active users: {len(active_users)}\n"
-        f"Download limit: {MAX_CONCURRENT_DOWNLOADS}"
+        "🟢 MegaYT Pro is online.\n"
+        f"Active downloads: {len(active_users)}\n"
+        f"Maximum concurrent downloads: "
+        f"{MAX_CONCURRENT_DOWNLOADS}"
     )
 
 
@@ -249,8 +361,8 @@ async def video_command(message: Message):
 
     if len(parts) not in (2, 3):
         await message.answer(
-            "Usage: /video URL [quality]\n"
-            "Example: /video https://youtu.be/VIDEO_ID 1080"
+            "Usage:\n/video YOUTUBE_URL [quality]\n\n"
+            "Example:\n/video https://youtu.be/VIDEO_ID 1080"
         )
         return
 
@@ -260,7 +372,11 @@ async def video_command(message: Message):
         await message.answer("Quality must be a number.")
         return
 
-    await process_download(message, parts[1], quality=quality)
+    await process_download(
+        message,
+        parts[1],
+        quality=quality,
+    )
 
 
 @dp.message(Command("audio"))
@@ -271,90 +387,110 @@ async def audio_command(message: Message):
     parts = (message.text or "").split(maxsplit=1)
 
     if len(parts) != 2:
-        await message.answer("Usage: /audio YOUTUBE_URL")
+        await message.answer(
+            "Usage:\n/audio YOUTUBE_URL"
+        )
         return
 
-    await process_download(message, parts[1].strip(), audio=True)
+    await process_download(
+        message,
+        parts[1].strip(),
+        audio=True,
+    )
 
 
 @dp.message(Command("cancel"))
 async def cancel_command(message: Message):
-    user_id = message.from_user.id
-
     if not await authorize(message):
         return
 
-    proc = jobs.get(user_id)
+    user_id = message.from_user.id
+    task = download_tasks.get(user_id)
 
-    if not proc or proc.returncode is not None:
+    if task is None or task.done():
         await message.answer("No active download to cancel.")
         return
 
-    cancelled.add(user_id)
-    proc.terminate()
+    task.cancel()
 
     await message.answer("🚫 Cancellation requested.")
 
 
 @dp.message(Command("allow"))
 async def allow_command(message: Message):
-    if not is_admin(message.from_user.id):
+    if not await admin_only(message):
         return
 
     parts = (message.text or "").split()
 
     if len(parts) != 2 or not parts[1].isdigit():
-        await message.answer("Usage: /allow TELEGRAM_USER_ID")
+        await message.answer(
+            "Usage: /allow TELEGRAM_USER_ID"
+        )
         return
 
     target = int(parts[1])
 
     async with auth_lock:
+        revoked_users.discard(target)
         allowed_users.add(target)
-        save_authorized_users()
+        save_access()
 
-    await message.answer(f"✅ Authorized user {target}.")
+    await message.answer(
+        f"✅ User {target} is now authorized."
+    )
 
 
 @dp.message(Command("revoke"))
 async def revoke_command(message: Message):
-    if not is_admin(message.from_user.id):
+    if not await admin_only(message):
         return
 
     parts = (message.text or "").split()
 
     if len(parts) != 2 or not parts[1].isdigit():
-        await message.answer("Usage: /revoke TELEGRAM_USER_ID")
+        await message.answer(
+            "Usage: /revoke TELEGRAM_USER_ID"
+        )
         return
 
     target = int(parts[1])
 
     if target in ADMIN_IDS:
-        await message.answer("Cannot revoke an administrator.")
+        await message.answer(
+            "❌ Administrator accounts cannot be revoked."
+        )
         return
 
     async with auth_lock:
         allowed_users.discard(target)
-        save_authorized_users()
+        revoked_users.add(target)
+        save_access()
 
-    proc = jobs.get(target)
+    task = download_tasks.get(target)
 
-    if proc and proc.returncode is None:
-        cancelled.add(target)
-        proc.terminate()
+    if task and not task.done():
+        task.cancel()
 
-    await message.answer(f"✅ Access revoked for {target}.")
+    await message.answer(
+        f"✅ Access revoked for user {target}."
+    )
 
 
 @dp.message(Command("users"))
 async def users_command(message: Message):
-    if not is_admin(message.from_user.id):
+    if not await admin_only(message):
         return
 
-    await message.answer(
-        "Authorized users:\n"
-        + "\n".join(str(x) for x in sorted(allowed_users))
+    users = sorted(allowed_users - revoked_users)
+
+    text = (
+        "👥 Authorized users:\n"
+        + "\n".join(str(user) for user in users)
+        if users else "No authorized users."
     )
+
+    await message.answer(text)
 
 
 @dp.message()
@@ -370,17 +506,38 @@ async def automatic_url(message: Message):
     if validate_url(url):
         await process_download(message, url)
     else:
-        await message.answer("Send a YouTube URL or use /help.")
+        await message.answer(
+            "Send an individual YouTube video URL "
+            "or use /help."
+        )
 
 
 async def main():
-    load_authorized_users()
-    Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
+    Path(DOWNLOAD_DIR).mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    log.info("MegaYT Pro v3 starting")
+    Path(AUTH_FILE).parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    load_authorized_users()
+
+    log.info("MegaYT Pro v3.1 starting")
     log.info("Authorized users: %s", len(allowed_users))
 
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types(),
+        )
+    finally:
+        for proc in list(download_processes.values()):
+            await stop_process(proc)
+
+        await session.close()
 
 
 if __name__ == "__main__":
